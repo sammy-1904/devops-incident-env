@@ -10,7 +10,7 @@ Environment variables (set in .env or system):
     HF_TOKEN          Your Hugging Face token (used as API key)
     API_BASE_URL      LLM endpoint (default: https://router.huggingface.co/v1)
     MODEL_NAME        Model to use (default: Qwen/Qwen2.5-7B-Instruct)
-    LOCAL_IMAGE_NAME  Docker image name (default: devops-incident-env)
+    LOCAL_IMAGE_NAME  Docker image name (optional — only needed when using from_docker_image())
 
 Usage:
     # Build and start the environment:
@@ -48,11 +48,11 @@ from client import IncidentEnv, IncidentAction
 # Configuration — all from environment variables
 # ---------------------------------------------------------------------------
 
-API_KEY          = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY", "")
+API_KEY          = os.environ.get("HF_TOKEN", "")
 API_BASE_URL     = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME       = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
-LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME", "devops-incident-env")
-# ENV_BASE_URL: set this to connect directly to a running server (e.g. the HF Space).
+LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")   # no default — set when using from_docker_image()
+# ENV_BASE_URL: connect directly to a running server (HF Space or local uvicorn).
 # Overrides LOCAL_IMAGE_NAME when provided.
 # Example: ENV_BASE_URL=https://sammy-1904-devops-incident-env.hf.space
 ENV_BASE_URL     = os.environ.get("ENV_BASE_URL", "")
