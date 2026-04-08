@@ -57,16 +57,23 @@ The inference script uses the OpenAI API client to process scenarios automatical
    python inference.py
    ```
 
-### 3. OpenEnv Validate & Push 
+### 3. Connect to the Live HF Space (no Docker needed)
 
-To ensure the environment conforms to the standard specification:
+The environment is deployed at:
+- **Web UI**: https://sammy-1904-devops-incident-env.hf.space/web
+- **Health**: https://sammy-1904-devops-incident-env.hf.space/health
+- **API Docs**: https://sammy-1904-devops-incident-env.hf.space/docs
+
+Run inference against the live Space:
 ```bash
-openenv validate
+ENV_BASE_URL=https://sammy-1904-devops-incident-env.hf.space python inference.py
 ```
 
-To submit your environment to Hugging Face Spaces:
+Or pull and run the Docker image locally from the HF registry:
 ```bash
-openenv push --repo-id <username>/devops-incident-env
+docker pull registry.hf.space/sammy-1904-devops-incident-env:latest
+docker run -d -p 8000:8000 registry.hf.space/sammy-1904-devops-incident-env:latest
+python inference.py
 ```
 
 ## Environment Design & Rewards

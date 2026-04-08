@@ -52,6 +52,10 @@ API_KEY          = os.environ.get("HF_TOKEN") or os.environ.get("API_KEY", "")
 API_BASE_URL     = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME       = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME", "devops-incident-env")
+# ENV_BASE_URL: set this to connect directly to a running server (e.g. the HF Space).
+# Overrides LOCAL_IMAGE_NAME when provided.
+# Example: ENV_BASE_URL=https://sammy-1904-devops-incident-env.hf.space
+ENV_BASE_URL     = os.environ.get("ENV_BASE_URL", "")
 
 TASK_NAME  = "devops-incident"
 BENCHMARK  = "devops-incident-env"
@@ -360,15 +364,20 @@ async def main() -> None:
 
     oai_client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
-    # Use from_docker_image for Docker-based deployment (matches sample pattern)
-    # Falls back to localhost if LOCAL_IMAGE_NAME is not a valid image
-    try:
-        env = await IncidentEnv.from_docker_image(LOCAL_IMAGE_NAME)
-        print(f"[INFO] Using Docker image: {LOCAL_IMAGE_NAME}", flush=True)
-    except Exception:
-        # Fallback: connect to already-running server (uvicorn)
-        env = IncidentEnv(base_url="http://localhost:8000")
-        print(f"[INFO] Connecting to running server at http://localhost:8000", flush=True)
+    # Connection priority:
+    #   1. ENV_BASE_URL — connect directly to a running server (HF Space or local uvicorn)
+    #   2. LOCAL_IMAGE_NAME — pull & start Docker image locally
+    #   3. Fallback — assume server already running on localhost:8000
+    if ENV_BASE_URL:
+        env = IncidentEnv(base_url=ENV_BASE_URL)
+        print(f"[INFO] Connecting to remote server: {ENV_BASE_URL}", flush=True)
+    else:
+        try:
+            env = await IncidentEnv.from_docker_image(LOCAL_IMAGE_NAME)
+            print(f"[INFO] Using Docker image: {LOCAL_IMAGE_NAME}", flush=True)
+        except Exception:
+            env = IncidentEnv(base_url="http://localhost:8000")
+            print(f"[INFO] Connecting to running server at http://localhost:8000", flush=True)
 
     results = []
     async with env:
