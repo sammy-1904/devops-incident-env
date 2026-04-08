@@ -11,12 +11,14 @@ That single call creates all required endpoints. We don't write routes manually.
 
 import os
 import uvicorn
+import gradio as gr
 
 # --- OpenEnv server factory (confirmed in openenv.core) ---
 from openenv.core import create_fastapi_app
 
 from .environment import IncidentEnvironment
 from .models import IncidentAction, IncidentObservation
+from .gradio_ui import create_gradio_app
 
 # create_fastapi_app signature (confirmed by inspection):
 #   create_fastapi_app(env_factory, action_cls, observation_cls, ...)
@@ -28,6 +30,10 @@ from .models import IncidentAction, IncidentObservation
 # Creates all endpoints automatically:
 #   POST /reset, POST /step, GET /state, GET /health, GET /ws, GET /web, GET /docs
 app = create_fastapi_app(IncidentEnvironment, IncidentAction, IncidentObservation)
+
+# Mount custom Gradio UI at /web (overrides the default OpenEnv web interface)
+gradio_demo = create_gradio_app()
+app = gr.mount_gradio_app(app, gradio_demo, path="/web")
 
 
 def main():
