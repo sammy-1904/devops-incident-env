@@ -21,10 +21,31 @@ Usage:
     python inference.py
 """
 
+import subprocess
+import sys
+
+# Auto-install required packages if missing (validator runs in a fresh environment)
+def _ensure_packages():
+    required = [
+        ("openai",       "openai>=1.0.0"),
+        ("dotenv",       "python-dotenv"),
+        ("openenv_core", "openenv-core"),
+    ]
+    for import_name, install_name in required:
+        try:
+            __import__(import_name)
+        except ImportError:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", install_name, "-q"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+_ensure_packages()
+
 import asyncio
 import json
 import os
-import sys
 import time
 import textwrap
 from pathlib import Path
