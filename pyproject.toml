@@ -1,0 +1,35 @@
+[project]
+name = "devops-incident-env"
+version = "1.0.0"
+description = "DevOps Incident Management RL environment — OpenEnv hackathon submission"
+requires-python = ">=3.11"
+
+dependencies = [
+    "openenv-core",
+    "fastapi",
+    "uvicorn[standard]",
+    "openai",
+    "pydantic>=2.0",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx",
+    "pytest",
+    "pytest-asyncio",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["server", "data", "client.py"]
+
+# `uv run server` starts the FastAPI server
+[project.scripts]
+server = "server.app:main"
+
+[tool.uv]
+dev-dependencies = []

@@ -1,0 +1,28 @@
+# openenv.yaml — OpenEnv manifest file
+# Controls Space settings when deployed with `openenv push`
+
+name: devops-incident-env
+version: "1.0.0"
+description: >
+  Production DevOps Incident Management environment for RL training.
+  An LLM agent acts as a senior SRE, investigating and resolving production
+  incidents through log analysis, metric inspection, and targeted remediation.
+  5 scenarios ranging from D:0.1 (single OOM crash) to D:1.0 (simultaneous
+  DDoS + config drift). Meaningful partial rewards and curriculum design.
+
+# Hugging Face Spaces hardware (free tier is sufficient for this env)
+hardware: cpu-basic
+
+# Environment variables passed into the container
+env:
+  ENABLE_WEB_INTERFACE: "true"
+  WORKERS: "1"
+
+# Tags shown on the HF Space
+tags:
+  - openenv
+  - rl-environment
+  - devops
+  - incident-management
+  - sre
+  - agent-environment
