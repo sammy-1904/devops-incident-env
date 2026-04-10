@@ -35,11 +35,16 @@ def _ensure_packages():
         try:
             __import__(import_name)
         except ImportError:
-            subprocess.check_call(
+            print(f"[SETUP] Installing {install_name}...", flush=True)
+            result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", install_name, "-q"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
             )
+            if result.returncode != 0:
+                print(f"[SETUP] pip install {install_name} failed:\n{result.stderr}", flush=True)
+                raise RuntimeError(f"Could not install required package: {install_name}")
+            print(f"[SETUP] Installed {install_name}", flush=True)
 
 _ensure_packages()
 
