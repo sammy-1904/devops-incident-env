@@ -350,15 +350,15 @@ async def run_episode(oai_client: OpenAI, env: IncidentEnv, scenario_id: int) ->
                     + (f"Alert: {obs.active_alerts[0]}" if obs.active_alerts else "All alerts cleared.")
                 )})
 
-        # Normalise score to [0, 1]
+        # Normalise score to (0, 1) exclusive — validator rejects 0.0 and 1.0
         total_reward = sum(rewards)
-        score   = min(max(total_reward / MAX_REWARD, 0.0), 1.0)
+        score   = min(max(total_reward / MAX_REWARD, 0.001), 0.999)
         success = obs.incident_resolved if obs is not None else False
 
     except Exception as e:
         error_msg = str(e)
         print(f"[DEBUG] Episode error: {e}", flush=True)
-        score = min(max(sum(rewards) / MAX_REWARD, 0.0), 1.0)
+        score = min(max(sum(rewards) / MAX_REWARD, 0.001), 0.999)
 
     finally:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
