@@ -31,6 +31,7 @@ from openenv.core import Action, Observation, State
 class IncidentAction(Action):
     action_type: str = Field(description="One of the valid action type strings above")
     service: str = Field(default="", description="Target service name (if applicable)")
+    hypothesis: str = Field(default="", description="Root cause hypothesis text (used with diagnose action)")
     parameters: Dict[str, Any] = Field(default_factory=dict, description="Extra params e.g. replicas")
     reasoning: str = Field(default="", description="Agent's explanation for this action")
     # metadata: Dict[str, Any] — inherited from Action base
@@ -43,7 +44,7 @@ class IncidentAction(Action):
 class IncidentObservation(Observation):
     # done: bool          — inherited (True when episode ends)
     # reward: float|None  — inherited (step reward)
-    # metadata: dict      — inherited (carries total_reward etc.)
+    # metadata: dict      — inherited (carries total_reward, scenario_max_reward, etc.)
 
     action_result: str = Field(default="", description="Human-readable result of the last action")
     service_dashboard: str = Field(default="", description="One-line status table of all services")
@@ -51,7 +52,11 @@ class IncidentObservation(Observation):
     steps_remaining: int = Field(default=0, description="Steps left before episode auto-fails")
     incident_resolved: bool = Field(default=False, description="Whether the incident is fully resolved")
     step_reward: float = Field(default=0.0, description="Reward earned on this specific step")
-    hint: Optional[str] = Field(default=None, description="Guidance hint (only on Scenario 1)")
+    hint: Optional[str] = Field(default=None, description="Guidance hint (only on Scenario 1 & 6, first 3 steps)")
+    recent_deployments: List[str] = Field(
+        default_factory=list,
+        description="Recent deployment events surfaced at episode start (service, version, timestamp)",
+    )
 
 
 # ---------------------------------------------------------------------------

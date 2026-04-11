@@ -9,7 +9,7 @@ Confirmed API (from inspecting openenv-core):
 """
 
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from openenv.core import Environment
 
@@ -29,6 +29,7 @@ R_CORRECT_DIAGNOSIS  =  20.0
 R_FIRST_LOOK_CULPRIT =   5.0
 R_PARTIAL_FIX        =  10.0
 R_GOOD_POSTMORTEM    =   5.0
+R_NO_ACTION_NEEDED   =  20.0   # bonus for Scenario 6: correct false-alarm identification
 
 P_WRONG_FIX          = -10.0
 P_REDUNDANT_ACTION   =  -2.0
@@ -56,7 +57,9 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         self._services: dict = {}
         self._action_log: List[str] = []
         self._fixes_applied: List[str] = []
+        self._wrong_fixes_applied: List[str] = []   # tracks wrong fixes for Scenario 6 bonus
         self._scenario_index: int = -1
+        self._diagnosis_groups_awarded: Set[int] = set()   # indices into correct_diagnosis_groups
 
     # -----------------------------------------------------------------------
     # reset()
@@ -75,7 +78,7 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         Args:
             seed: Unused (reserved by OpenEnv spec).
             episode_id: Caller-supplied episode ID; auto-generated if None.
-            scenario_id: 1–5 to pick a specific scenario; cycles if None.
+            scenario_id: 1–6 to pick a specific scenario; cycles if None.
         """
         # Pick scenario
         if scenario_id is not None and scenario_id in SCENARIO_BY_ID:
@@ -103,6 +106,8 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
 
         self._action_log = []
         self._fixes_applied = []
+        self._wrong_fixes_applied = []
+        self._diagnosis_groups_awarded = set()
 
         self._state = IncidentState(
             episode_id=episode_id or str(uuid.uuid4()),
@@ -117,10 +122,25 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         )
 
         dashboard = self._build_dashboard()
+
+        # Format recent deployment events for the observation
+        if sc.deployment_events:
+            deploy_lines = "\n".join(
+                f"  {e.timestamp} | {e.service}: {e.old_version} → {e.new_version} by {e.deployed_by}"
+                for e in sc.deployment_events
+            )
+        else:
+            deploy_lines = "  None in the last 30 minutes"
+
+        recent_deployments = [
+            f"{e.timestamp} | {e.service}: {e.old_version} → {e.new_version} by {e.deployed_by}"
+            for e in sc.deployment_events
+        ]
+
         return IncidentObservation(
             done=False,
             reward=0.0,
-            metadata={},
+            metadata={"scenario_max_reward": sc.max_reward},
             action_result=(
                 f"=== INCIDENT OPENED ===\n"
                 f"Scenario: {sc.name} (Difficulty: {sc.difficulty:.1f})\n"
@@ -136,7 +156,8 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
                 f"  diagnose <root_cause_text>    — state your hypothesis\n"
                 f"  escalate <reason>             — hand off to human\n"
                 f"  write_postmortem <text>       — close incident\n\n"
-                f"SERVICES: {', '.join(sc.services.keys())}"
+                f"SERVICES: {', '.join(sc.services.keys())}\n\n"
+                f"RECENT DEPLOYMENTS:\n{deploy_lines}"
             ),
             service_dashboard=dashboard,
             active_alerts=[sc.alert_message],
@@ -144,6 +165,7 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
             incident_resolved=False,
             step_reward=0.0,
             hint=sc.hint,
+            recent_deployments=recent_deployments,
         )
 
     # -----------------------------------------------------------------------
@@ -166,7 +188,7 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
 
         action_key = f"{action.action_type}:{action.service}"
 
-        # Format reward: small bonus for non-trivial reasoning (RL training signal)
+        # Small bonus for non-trivial reasoning (RL training signal)
         if len(action.reasoning.strip()) > 30:
             step_reward += 1.0
 
@@ -186,7 +208,9 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
             step_reward += reward
 
         elif action.action_type == "diagnose":
-            result_text, reward = self._handle_diagnose(action.service or action.reasoning)
+            # Read hypothesis from the dedicated field first, fall back to service/reasoning
+            text = action.hypothesis or action.service or action.reasoning
+            result_text, reward = self._handle_diagnose(text)
             step_reward += reward
 
         elif action.action_type == "escalate":
@@ -201,7 +225,7 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
             result_text = f"Unknown action_type: '{action.action_type}'. No effect."
             step_reward = -1.0
 
-        # Redundancy penalty
+        # Redundancy penalty for repeated information queries
         if action.action_type in ("query_logs", "check_metrics"):
             self._action_log.append(action_key)
             count = self._action_log.count(action_key)
@@ -232,14 +256,14 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         return IncidentObservation(
             done=done,
             reward=step_reward,
-            metadata={"total_reward": self._state.total_reward},
+            metadata={"total_reward": self._state.total_reward, "scenario_max_reward": sc.max_reward},
             action_result=result_text,
             service_dashboard=dashboard,
             active_alerts=alerts,
             steps_remaining=max(0, steps_left),
             incident_resolved=self._state.resolved,
             step_reward=step_reward,
-            hint=sc.hint if self._state.step_count <= 2 else None,
+            hint=sc.hint if self._state.step_count <= 3 else None,
         )
 
     # -----------------------------------------------------------------------
@@ -321,6 +345,17 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         if service not in self._services:
             return (f"Error: '{service}' not found. Available: {', '.join(self._services.keys())}", 0.0, False)
 
+        # Scenario 6 (false alarm): any fix attempt on a healthy system is penalised
+        if not sc.correct_fix_actions:
+            self._wrong_fixes_applied.append(fix_key)
+            return (
+                f"[WRONG ACTION] {action_type.replace('_', ' ').title()} on {service}.\n"
+                f"All services are operating normally. This action was unnecessary.\n"
+                f"Penalty: {P_WRONG_FIX:.0f}. Investigate more before acting.",
+                P_WRONG_FIX,
+                False,
+            )
+
         if fix_key in sc.correct_fix_actions:
             self._fixes_applied.append(fix_key)
             self._services[service].status = "healthy"
@@ -348,6 +383,7 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
                     False,
                 )
         else:
+            self._wrong_fixes_applied.append(fix_key)
             return (
                 f"[FAILED] {action_type.replace('_', ' ').title()} on {service}. No improvement observed.\n"
                 f"Incident still active. Is this really the root cause?\n",
@@ -357,26 +393,56 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
 
     def _handle_diagnose(self, hypothesis: str):
         sc = self._scenario
-        matched = any(kw in hypothesis.lower() for kw in sc.correct_diagnoses)
+        hypothesis_lower = hypothesis.lower()
 
-        if matched and not self._state.correct_diagnosis_given:
-            self._state.correct_diagnosis_given = True
+        # Anti-reward-hacking gate: require at least one root-cause service to have been
+        # investigated before a diagnosis can earn reward.  This prevents a model from
+        # collecting +20 by keyword-stuffing ("oom connection pool deployment ddos …")
+        # without doing any actual investigation.
+        if self._state.services_investigated == 0:
             return (
-                f"[DIAGNOSIS ACCEPTED] '{hypothesis}'\nMatches actual root cause. +{R_CORRECT_DIAGNOSIS:.0f} reward.\n"
-                f"Now apply the correct remediation action.",
-                R_CORRECT_DIAGNOSIS,
-            )
-        elif matched:
-            return "[DIAGNOSIS] Already recorded. Focus on remediation.", 0.0
-        else:
-            return (
-                f"[DIAGNOSIS] '{hypothesis}' — does not match root cause. No reward. Keep investigating.",
+                "[DIAGNOSIS REJECTED] You have not investigated any root-cause services yet.\n"
+                "Use query_logs or check_metrics on the affected services first, then diagnose.\n"
+                "No reward awarded.",
                 0.0,
             )
 
+        # Check each diagnosis group independently (supports multi-root-cause scenarios)
+        for i, group in enumerate(sc.correct_diagnosis_groups):
+            if any(kw in hypothesis_lower for kw in group):
+                if i not in self._diagnosis_groups_awarded:
+                    self._diagnosis_groups_awarded.add(i)
+                    # correct_diagnosis_given is True when ALL groups are awarded
+                    self._state.correct_diagnosis_given = (
+                        len(self._diagnosis_groups_awarded) == len(sc.correct_diagnosis_groups)
+                    )
+                    groups_remaining = len(sc.correct_diagnosis_groups) - len(self._diagnosis_groups_awarded)
+                    extra = (
+                        f" ({groups_remaining} more root cause(s) to identify.)"
+                        if groups_remaining > 0 else ""
+                    )
+                    return (
+                        f"[DIAGNOSIS ACCEPTED] '{hypothesis}'\n"
+                        f"Matches root cause group {i + 1}/{len(sc.correct_diagnosis_groups)}. "
+                        f"+{R_CORRECT_DIAGNOSIS:.0f} reward.{extra}\n"
+                        f"Now apply the correct remediation action.",
+                        R_CORRECT_DIAGNOSIS,
+                    )
+                else:
+                    return (
+                        f"[DIAGNOSIS] Root cause group {i + 1} already recorded. Focus on remediation.",
+                        0.0,
+                    )
+
+        return (
+            f"[DIAGNOSIS] '{hypothesis}' — does not match any root cause. No reward. Keep investigating.",
+            0.0,
+        )
+
     def _handle_escalate(self, reason: str):
         sc = self._scenario
-        if sc.id in (1, 2, 3, 4):
+        # Use the scenario's escalation_correct field instead of hardcoded IDs
+        if not sc.escalation_correct:
             return (
                 f"[ESCALATION] Handed off: '{reason}'\nThis incident WAS solvable. Penalty: {P_WRONG_ESCALATE:.0f}.",
                 P_WRONG_ESCALATE,
@@ -392,10 +458,51 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         return (f"[ESCALATION] '{reason}'\nEpisode ended.", P_UNRESOLVED_END, True)
 
     def _handle_postmortem(self, report: str):
+        sc = self._scenario
+        report_lower = report.lower()
+
+        # Scenario 6 (false alarm): reward if no wrong fixes were applied
+        if not sc.correct_fix_actions:
+            if not self._wrong_fixes_applied and self._state.correct_diagnosis_given:
+                # Perfect false-alarm resolution: diagnosed correctly, no unnecessary actions
+                all_kws = [kw for group in sc.correct_diagnosis_groups for kw in group]
+                matched = sum(1 for kw in all_kws if kw in report_lower)
+                quality_bonus = min(matched * 1.5, 10.0)
+                total = R_GOOD_POSTMORTEM + R_NO_ACTION_NEEDED + quality_bonus
+                self._state.resolved = True
+                return (
+                    f"[POST-MORTEM SUBMITTED]\nCorrectly identified as a false alarm with no unnecessary actions.\n"
+                    f"Quality bonus: +{quality_bonus:.1f} | No-action bonus: +{R_NO_ACTION_NEEDED:.0f}\n"
+                    f"{report}\n\nIncident closed. +{total:.1f} total reward.",
+                    total,
+                    True,
+                )
+            elif self._wrong_fixes_applied:
+                return (
+                    f"[POST-MORTEM — PENALISED]\nUnnecessary fix actions were applied to a healthy system.\n"
+                    f"{report}\n\nIncident closed with penalty: {P_UNRESOLVED_END:.0f}.",
+                    P_UNRESOLVED_END,
+                    True,
+                )
+            else:
+                # Submitted postmortem without diagnosing first
+                return (
+                    f"[POST-MORTEM — INCOMPLETE]\nDiagnose the root cause before submitting a postmortem.\n"
+                    f"Penalty: {P_UNRESOLVED_END:.0f}.",
+                    P_UNRESOLVED_END,
+                    True,
+                )
+
         if self._state.resolved:
+            # Score quality by matching postmortem text against diagnosis keywords
+            all_kws = [kw for group in sc.correct_diagnosis_groups for kw in group]
+            matched = sum(1 for kw in all_kws if kw in report_lower)
+            quality_bonus = min(matched * 1.5, 10.0)
+            total = R_GOOD_POSTMORTEM + quality_bonus
             return (
-                f"[POST-MORTEM SUBMITTED]\n{report}\n\nIncident closed. +{R_GOOD_POSTMORTEM:.0f} bonus.",
-                R_GOOD_POSTMORTEM,
+                f"[POST-MORTEM SUBMITTED]\nQuality bonus: +{quality_bonus:.1f}\n"
+                f"{report}\n\nIncident closed. +{total:.1f} reward.",
+                total,
                 True,
             )
         return (

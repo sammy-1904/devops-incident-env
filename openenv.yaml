@@ -7,8 +7,9 @@ description: >
   Production DevOps Incident Management environment for RL training.
   An LLM agent acts as a senior SRE, investigating and resolving production
   incidents through log analysis, metric inspection, and targeted remediation.
-  5 scenarios ranging from D:0.1 (single OOM crash) to D:1.0 (simultaneous
-  DDoS + config drift). Meaningful partial rewards and curriculum design.
+  6 scenarios ranging from D:0.1 (single OOM crash) to D:1.0 (simultaneous
+  DDoS + config drift), including a false-alarm scenario. Meaningful partial
+  rewards, multi-diagnosis support, and postmortem quality scoring.
 
 # Hugging Face Spaces hardware (free tier is sufficient for this env)
 hardware: cpu-basic

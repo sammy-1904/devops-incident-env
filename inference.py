@@ -11,6 +11,7 @@ Environment variables (set in .env or system):
     API_BASE_URL      LLM endpoint (default: https://router.huggingface.co/v1)
     MODEL_NAME        Model to use (default: Qwen/Qwen2.5-7B-Instruct)
     LOCAL_IMAGE_NAME  Docker image name (optional — only needed when using from_docker_image())
+    ENV_BASE_URL      Connect directly to a running server (HF Space or local uvicorn)
 
 Usage:
     # Build and start the environment:
@@ -51,7 +52,6 @@ _ensure_packages()
 import asyncio
 import json
 import os
-import time
 import textwrap
 from pathlib import Path
 from typing import List, Optional
@@ -77,7 +77,7 @@ from client import IncidentEnv, IncidentAction
 API_KEY          = os.environ.get("HF_TOKEN", "")
 API_BASE_URL     = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME       = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
-LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")   # no default — set when using from_docker_image()
+LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME")
 # ENV_BASE_URL: connect directly to a running server (HF Space or local uvicorn).
 # Overrides LOCAL_IMAGE_NAME when provided.
 # Example: ENV_BASE_URL=https://sammy-1904-devops-incident-env.hf.space
@@ -86,10 +86,9 @@ ENV_BASE_URL     = os.environ.get("ENV_BASE_URL", "")
 TASK_NAME  = "devops-incident"
 BENCHMARK  = "devops-incident-env"
 MAX_STEPS  = 22          # worst-case max (Scenario 5)
-MAX_REWARD = 70.0        # theoretical max per episode (used for score normalisation)
 
-# Scenarios to evaluate (at least 2 required by checklist)
-SCENARIOS_TO_RUN = [1, 2, 3, 4, 5]
+# Scenarios to evaluate (all 6 — exceeds the minimum-2-tasks requirement)
+SCENARIOS_TO_RUN = [1, 2, 3, 4, 5, 6]
 
 # ---------------------------------------------------------------------------
 # Required stdout helpers  (exact format from sample_inference.py)
@@ -176,7 +175,10 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "diagnose",
-        "description": "State your root cause hypothesis once you are confident.",
+        "description": (
+            "State your root cause hypothesis once you are confident. "
+            "In multi-incident scenarios, call diagnose() once per distinct root cause."
+        ),
         "parameters": {"type": "object", "properties": {
             "root_cause": {"type": "string", "description": "Clear description of the root cause"},
             "reasoning":  {"type": "string"},
@@ -184,14 +186,18 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "write_postmortem",
-        "description": "Submit a post-mortem and close the incident. Only after incident is resolved.",
+        "description": (
+            "Submit a post-mortem and close the incident. "
+            "For false alarms with no fix needed, submit after diagnosing the real cause. "
+            "For real incidents, only submit after the incident is fully resolved."
+        ),
         "parameters": {"type": "object", "properties": {
             "report": {"type": "string"},
         }, "required": ["report"]},
     }},
     {"type": "function", "function": {
         "name": "escalate",
-        "description": "Escalate to a human on-call. Only if you cannot resolve it yourself.",
+        "description": "Escalate to a human on-call. Only if you truly cannot resolve it yourself.",
         "parameters": {"type": "object", "properties": {
             "reason": {"type": "string"},
         }, "required": ["reason"]},
@@ -200,50 +206,91 @@ TOOLS = [
 
 SYSTEM_PROMPT = textwrap.dedent("""
     You are a senior Site Reliability Engineer (SRE) responding to a production incident.
-    Your job is to:
-      1. Investigate using query_logs and check_metrics
-      2. Identify the root cause with diagnose()
-      3. Apply the correct fix (restart_service, rollback_deployment, etc.)
-      4. Write a post-mortem once resolved
 
-    Rules:
-    - Always use the 'reasoning' field to explain your thinking.
+    CRITICAL SCORING RULES — follow these exactly to maximise your score:
+    1. Call diagnose() BEFORE applying any fix. diagnose() earns +20 points per root cause.
+       Applying a fix without diagnosing first permanently skips those +20 points.
+    2. Call write_postmortem() after the incident is resolved. It earns +5 to +15 points.
+       Include root-cause keywords in the report (e.g. "oom", "connection pool", "deployment").
+    3. For false alarms: diagnose() then write_postmortem() immediately — do NOT apply any fix.
+
+    INVESTIGATION WORKFLOW (follow in order):
+    1. query_logs / check_metrics on the alerting service — gather evidence
+    2. diagnose(root_cause=...) — state the root cause (call once per distinct root cause)
+    3. Apply the correct fix action
+    4. write_postmortem() — close the incident
+
+    RULES:
+    - Always provide a detailed 'reasoning' field (>30 chars) for every action — earns bonus points.
     - Start by querying logs for the service mentioned in the alert.
-    - Do NOT restart random services — investigate first.
-    - Call diagnose() once you know the root cause, then fix it.
+    - Do NOT restart random services. Investigate first, diagnose, then fix.
     - Do NOT escalate unless all options are exhausted.
 
-    Fix selection guide:
-    - Service is "down" with OOM / memory errors → restart_service
-    - Service is "down" after a recent deployment → rollback_deployment
-    - Service is "down" after a config change → rollback_config
-    - DB connection pool errors → restart_service on the DB, then restart dependent services
-    - Cascading failures (multiple services down) → restart_service each one
-    - Traffic surge / DDoS → enable_rate_limiting on api-gateway
-    - Circuit breaker needed → enable_circuit_breaker on the failing service
+    DISTINGUISHING ROOT CAUSES FROM DOWNSTREAM VICTIMS:
+    - Root cause: the service whose OWN logs show the original failure
+      (OOMKilled, deployment crash, config change, connection leak, traffic spike).
+    - Downstream victim: a service that failed ONLY because it cannot reach the root cause.
+      Its logs show "connection refused", "upstream unavailable", "503 from <other service>".
+    - Restarting downstream victims does nothing — fix the root cause first.
+    - When many services are down, find the one with the ORIGINAL failure in its own logs.
 
-    After [PARTIAL SUCCESS]:
-    - The incident is NOT fully resolved. Check the dashboard for services still "down" or "degraded".
-    - Apply the SAME type of fix (e.g. restart_service) to OTHER affected services still showing problems.
-    - Do NOT switch to a different fix type unless logs specifically indicate it.
-    - Do NOT escalate after a partial success — you're on the right track, keep going.
+    FIX SELECTION GUIDE:
+    - Service OOMKilled / memory limit in logs     → restart_service on THAT service
+    - Services down after a recent deployment      → rollback_deployment on that service
+    - Services down after a config change          → rollback_config on that service
+    - DB connection pool exhausted in DB logs +
+      connection leak in one service's logs        → restart_service:postgres-db,
+                                                     then restart_service on the leaking service
+    - Traffic surge / DDoS on api-gateway          → enable_rate_limiting:api-gateway
+    - Cascading from one upstream OOM              → restart_service on the OOM'd service,
+                                                     then enable_circuit_breaker on services
+                                                     that were depending on it
 
-    Cascading failure pattern (multiple services down from one upstream cause):
-    - Identify the upstream root cause — usually the service with OOM/memory errors in its logs.
-    - restart_service on the upstream root cause FIRST.
-    - Then enable_circuit_breaker on downstream services still showing errors.
-    - Do NOT try to fix downstream services directly — fix the root upstream first, then isolate.
+    AFTER [PARTIAL SUCCESS]:
+    - At least one more fix is needed.
+    - Re-read ALL logs you collected. Find the NEXT root cause service — the one whose own logs
+      show an original failure, not just "cannot reach upstream".
+    - The second fix MAY be a DIFFERENT action type than the first
+      (e.g. restart_service for one cause, enable_circuit_breaker for another).
+    - Do NOT restart a service just because it is "down" in the dashboard — check its logs.
+      If it is down ONLY because its upstream is unavailable, it is a victim, not a root cause.
 
-    Multi-incident pattern (two independent alerts, different failure types):
-    - Treat each alert independently — they may have completely different root causes.
-    - Use query_logs on EACH failing service to understand what type of failure each one is.
-    - Apply the correct fix type for EACH independently (e.g. rate limiting for traffic surge, rollback_config for config drift).
-    - Do NOT assume the same fix type applies to both.
+    MULTI-INCIDENT PATTERN (two independent alerts):
+    - Treat each alert as a separate investigation with a separate root cause.
+    - Call diagnose() for each root cause separately (you earn +20 per correct diagnosis).
+    - Apply a separate fix for each. Do NOT assume the same fix type applies to both.
 
-    After incident is RESOLVED (incident_resolved=True):
-    - ALWAYS call write_postmortem() immediately with a brief summary.
-    - This earns bonus reward and formally closes the incident.
-    - Do NOT call any other action after the incident is resolved.
+    FALSE ALARM PATTERN:
+    - Check api-gateway logs for "load test", "scheduled", "planned", "ci-pipeline".
+    - If caused by expected activity: call diagnose() explaining the real cause.
+    - Do NOT apply any fix to healthy services.
+    - Immediately call write_postmortem() after diagnosing.
+
+    WORKED EXAMPLE — single OOM crash (follow this pattern exactly):
+
+      Alert: payment-service health checks failing.
+
+      Step 1 — query_logs(service="payment-service", reasoning="Start with the service named in the alert")
+        Result: FATAL Killed by signal 9 (OOMKilled). Memory limit exceeded: 256Mi
+
+      Step 2 — diagnose(root_cause="payment-service OOMKilled: memory limit 256Mi exceeded",
+                        reasoning="Logs confirm OOMKilled signal. This is the root cause.")
+        Result: [DIAGNOSIS ACCEPTED] +20 reward.
+
+      Step 3 — restart_service(service="payment-service",
+                               reasoning="OOMKilled process needs restart to recover")
+        Result: [SUCCESS] Incident RESOLVED. +30 reward.
+
+      Step 4 — write_postmortem(report="payment-service was OOMKilled after exceeding its 256Mi memory limit.
+                                Restarted service to restore. Root cause: memory limit too low or leak present.",
+                                reasoning="Closing resolved incident")
+        Result: +7 reward.
+
+    Key takeaways from the example:
+    - Always query_logs FIRST, then diagnose, then fix, then postmortem.
+    - diagnose() uses keywords from the logs (e.g. "oom", "memory limit", "oomkilled").
+    - write_postmortem() is called AFTER the fix, not before.
+    - For cascading failures: fix root cause first, then remaining affected services.
 """).strip()
 
 # ---------------------------------------------------------------------------
@@ -261,37 +308,60 @@ async def run_episode(oai_client: OpenAI, env: IncidentEnv, scenario_id: int) ->
     success = False
     error_msg = None
     obs = None
+    scenario_max_reward = 80.0   # safe fallback; overwritten from reset metadata
 
     try:
         # Reset — pass scenario_id so the server picks the right scenario
         result = await env.reset(scenario_id=scenario_id)
         obs = result.observation
 
+        # Read per-scenario max reward from metadata (set by environment.reset())
+        scenario_max_reward = float(obs.metadata.get("scenario_max_reward", scenario_max_reward))
+
         alert = obs.active_alerts[0] if obs.active_alerts else "No alert"
         print(f"\n[INFO] Scenario {scenario_id}: {alert[:80]}", flush=True)
         print(obs.service_dashboard, flush=True)
+
+        # Build initial user message, including deployment events if any
+        deploy_section = ""
+        if obs.recent_deployments:
+            deploy_section = "\n\nRECENT DEPLOYMENTS:\n" + "\n".join(
+                f"  {d}" for d in obs.recent_deployments
+            )
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": (
                 f"INCIDENT ALERT:\n{alert}\n\n"
-                f"{obs.service_dashboard}\n\n"
+                f"{obs.service_dashboard}"
+                f"{deploy_section}\n\n"
                 f"Steps remaining: {obs.steps_remaining}\n\n"
                 f"Investigate and resolve the incident."
             )},
         ]
 
-        for step in range(1, MAX_STEPS + 1):
-            if result.done:
-                break
+        # Allow one extra turn for write_postmortem when a fix action resolves the incident
+        _allow_postmortem = False
+        _terminal_actions = {"write_postmortem", "escalate"}
+        tool_name = ""
 
-            # LLM call
+        for step in range(1, MAX_STEPS + 1):
+            if result.done and not _allow_postmortem:
+                break
+            _allow_postmortem = False  # consume the extra turn
+
+            # LLM call — run in a thread so the sync OpenAI client
+            # doesn't block the asyncio event loop (which would drop the WebSocket).
             try:
-                response = oai_client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: oai_client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        tools=TOOLS,
+                        tool_choice="auto",
+                    ),
                 )
             except Exception as e:
                 error_msg = str(e)
@@ -300,11 +370,17 @@ async def run_episode(oai_client: OpenAI, env: IncidentEnv, scenario_id: int) ->
 
             msg = response.choices[0].message
 
-            # No tool call — nudge the model
+            # No tool call — give a context-aware nudge
             if not msg.tool_calls:
                 content = msg.content or "(no response)"
                 messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": "Use one of the available tools to take an action."})
+                if obs and obs.incident_resolved:
+                    nudge = "Call write_postmortem() now to close the incident and earn the quality bonus."
+                elif not rewards:
+                    nudge = "Call query_logs() on the service mentioned in the alert to start investigating."
+                else:
+                    nudge = "Use one of the available tools to continue your investigation or apply a fix."
+                messages.append({"role": "user", "content": nudge})
                 log_step(step=step, action="no_tool_call", reward=0.0, done=False, error=None)
                 continue
 
@@ -313,16 +389,26 @@ async def run_episode(oai_client: OpenAI, env: IncidentEnv, scenario_id: int) ->
             tool_name = tool_call.function.name
             args      = json.loads(tool_call.function.arguments)
 
-            service   = args.get("service", args.get("root_cause", ""))
+            # Routing: diagnose tool uses 'root_cause' param; others use 'service'
+            service   = args.get("service", "")
+            hypothesis = args.get("root_cause", "")
             reasoning = args.get("reasoning", args.get("reason", args.get("report", "")))
-            params    = {k: v for k, v in args.items() if k not in ("service", "reasoning", "root_cause", "reason", "report")}
-            action_str = f"{tool_name}(service={service!r})"
+            params    = {
+                k: v for k, v in args.items()
+                if k not in ("service", "reasoning", "root_cause", "reason", "report")
+            }
+
+            if tool_name == "diagnose":
+                action_str = f"diagnose(root_cause={hypothesis!r})"
+            else:
+                action_str = f"{tool_name}(service={service!r})"
 
             # Step the environment
             try:
                 result = await env.step(IncidentAction(
                     action_type=tool_name,
                     service=service,
+                    hypothesis=hypothesis,
                     reasoning=reasoning,
                     parameters=params,
                 ))
@@ -343,22 +429,31 @@ async def run_episode(oai_client: OpenAI, env: IncidentEnv, scenario_id: int) ->
             messages.append({"role": "assistant", "content": None, "tool_calls": msg.tool_calls})
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": obs.action_result})
 
-            if not done:
+            if done and obs.incident_resolved and tool_name not in _terminal_actions:
+                # Fix action resolved the incident — give one extra turn for write_postmortem
+                _allow_postmortem = True
+                messages.append({"role": "user", "content": (
+                    "✓ INCIDENT RESOLVED! Call write_postmortem() now to close the incident "
+                    "and earn a quality bonus. Include the root cause keywords in your report "
+                    "(e.g. 'oom', 'connection pool', 'bad deployment', 'config change', 'ddos')."
+                )})
+            elif not done:
                 messages.append({"role": "user", "content": (
                     f"{obs.service_dashboard}\n\n"
                     f"Steps remaining: {obs.steps_remaining} | Resolved: {obs.incident_resolved}\n"
                     + (f"Alert: {obs.active_alerts[0]}" if obs.active_alerts else "All alerts cleared.")
                 )})
 
-        # Normalise score to (0, 1) exclusive — validator rejects 0.0 and 1.0
+        # Normalise score to (0, 1) exclusive — validator rejects exactly 0.0 and 1.0
         total_reward = sum(rewards)
-        score   = min(max(total_reward / MAX_REWARD, 0.001), 0.999)
+        score   = min(max(total_reward / scenario_max_reward, 0.001), 0.999)
         success = obs.incident_resolved if obs is not None else False
 
     except Exception as e:
         error_msg = str(e)
         print(f"[DEBUG] Episode error: {e}", flush=True)
-        score = min(max(sum(rewards) / MAX_REWARD, 0.001), 0.999)
+        total_reward = sum(rewards)
+        score = min(max(total_reward / scenario_max_reward, 0.001), 0.999)
 
     finally:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
@@ -411,7 +506,7 @@ async def main() -> None:
             summary = await run_episode(oai_client, env, scenario_id)
             results.append(summary)
             if i < len(SCENARIOS_TO_RUN) - 1:
-                time.sleep(3)  # avoid HF rate limits between scenarios
+                await asyncio.sleep(3)  # avoid HF rate limits between scenarios
 
     # Final summary
     print("\n" + "="*70, flush=True)
@@ -422,7 +517,10 @@ async def main() -> None:
     print(f"Avg score: {avg_score:.3f}", flush=True)
     for r in results:
         status = "RESOLVED" if r["resolved"] else "UNRESOLVED"
-        print(f"  Scenario {r['scenario_id']}: {status} | steps={r['steps_used']} | score={r['score']:.3f}", flush=True)
+        print(
+            f"  Scenario {r['scenario_id']}: {status} | steps={r['steps_used']} | score={r['score']:.3f}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

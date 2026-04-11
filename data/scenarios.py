@@ -1,5 +1,5 @@
 """
-scenarios.py — Ground truth definitions for all 5 incident scenarios.
+scenarios.py — Ground truth definitions for all 6 incident scenarios.
 
 This file has ZERO OpenEnv dependencies. It is pure Python data.
 The environment.py imports from here to set up each episode.
@@ -10,9 +10,13 @@ Each scenario contains:
   - Ground truth root cause(s) — NEVER shown to the agent
   - Correct fix actions — used by grader to assign reward
   - Red herring services — services with symptoms that are NOT the root cause
+  - correct_diagnosis_groups — list of keyword lists, one per distinct root cause
+    (used for multi-diagnosis support; Scenario 5 has 2 groups)
+  - escalation_correct — True only if escalating is the intended resolution
+  - max_reward — theoretical max per episode (for score normalisation)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 
@@ -58,10 +62,13 @@ class Scenario:
     services: Dict[str, ServiceState]
     logs: List[LogEntry]         # all logs in the system (agent retrieves by service)
     deployment_events: List[DeploymentEvent]
-    root_cause_services: List[str]   # HIDDEN — used for grading
-    correct_fix_actions: List[str]   # HIDDEN — e.g. ["restart_service:user-service"]
-    correct_diagnoses: List[str]     # HIDDEN — root cause text agent should say
+    root_cause_services: List[str]        # HIDDEN — used for grading
+    correct_fix_actions: List[str]        # HIDDEN — e.g. ["restart_service:user-service"]
+    correct_diagnoses: List[str]          # HIDDEN — flat union of all diagnosis keywords
+    correct_diagnosis_groups: List[List[str]]  # HIDDEN — one list per distinct root cause
     max_steps: int
+    max_reward: float = 70.0     # theoretical max per episode for score normalisation
+    escalation_correct: bool = False  # True only if escalation is the intended resolution
     hint: Optional[str] = None   # only non-None on scenario 1 (easiest)
 
 
@@ -111,7 +118,13 @@ SCENARIO_1 = Scenario(
     root_cause_services=["user-service"],
     correct_fix_actions=["restart_service:user-service"],
     correct_diagnoses=["oom", "out of memory", "memory limit", "oomkilled"],
+    correct_diagnosis_groups=[
+        ["oom", "out of memory", "memory limit", "oomkilled", "signal 9", "512mi"],
+    ],
     max_steps=8,
+    # diag(20) + fix(30) + first-look(5) + postmortem(5+10) + efficiency(~5) + reasoning(~7)
+    max_reward=82.0,
+    escalation_correct=False,
     hint="Tip: Start by querying logs for the service mentioned in the alert, then check its metrics.",
 )
 
@@ -159,27 +172,39 @@ SCENARIO_2 = Scenario(
         ),
     },
     logs=[
-        LogEntry("2024-01-15 16:00:03", "order-service",       "INFO",  "Deployment started: 5.2.1 → 5.3.0 by jenkins-ci"),
-        LogEntry("2024-01-15 16:00:41", "order-service",       "INFO",  "Deployment completed: running version 5.3.0"),
-        LogEntry("2024-01-15 16:01:14", "order-service",       "ERROR", "NullPointerException at OrderProcessor.calculateDiscount(OrderProcessor.java:247)"),
-        LogEntry("2024-01-15 16:01:15", "order-service",       "ERROR", "NullPointerException at OrderProcessor.calculateDiscount(OrderProcessor.java:247)"),
-        LogEntry("2024-01-15 16:01:22", "order-service",       "ERROR", "Unhandled exception in request handler. Returning 500."),
-        LogEntry("2024-01-15 16:02:10", "api-gateway",         "WARN",  "upstream order-service response time: 3100ms (threshold: 500ms)"),
-        LogEntry("2024-01-15 16:05:00", "api-gateway",         "ERROR", "Circuit breaker OPEN for order-service (error rate 65%)"),
-        LogEntry("2024-01-15 16:10:00", "api-gateway",         "ERROR", "p99 latency threshold breached: 2800ms. Firing alert."),
-        LogEntry("2024-01-15 15:55:00", "notification-service", "INFO", "Scheduled batch job started: digest-email-sender"),
-        LogEntry("2024-01-15 16:08:00", "notification-service", "INFO", "Batch job in progress: 45,000/120,000 emails processed"),
-        LogEntry("2024-01-15 16:09:00", "auth-service",        "INFO",  "Processed 1240 authentication requests. All successful."),
+        LogEntry("2024-01-15 16:00:03", "order-service",        "INFO",  "Deployment started: 5.2.1 → 5.3.0 by jenkins-ci"),
+        LogEntry("2024-01-15 16:00:41", "order-service",        "INFO",  "Deployment completed: running version 5.3.0"),
+        LogEntry("2024-01-15 16:01:14", "order-service",        "ERROR", "NullPointerException at OrderProcessor.calculateDiscount(OrderProcessor.java:247)"),
+        LogEntry("2024-01-15 16:01:15", "order-service",        "ERROR", "NullPointerException at OrderProcessor.calculateDiscount(OrderProcessor.java:247)"),
+        LogEntry("2024-01-15 16:01:22", "order-service",        "ERROR", "Unhandled exception in request handler. Returning 500."),
+        LogEntry("2024-01-15 16:02:10", "api-gateway",          "WARN",  "upstream order-service response time: 3100ms (threshold: 500ms)"),
+        LogEntry("2024-01-15 16:05:00", "api-gateway",          "ERROR", "Circuit breaker OPEN for order-service (error rate 65%)"),
+        LogEntry("2024-01-15 16:10:00", "api-gateway",          "ERROR", "p99 latency threshold breached: 2800ms. Firing alert."),
+        LogEntry("2024-01-15 15:55:00", "notification-service", "INFO",  "Scheduled batch job started: digest-email-sender"),
+        LogEntry("2024-01-15 16:08:00", "notification-service", "INFO",  "Batch job in progress: 45,000/120,000 emails processed"),
+        LogEntry("2024-01-15 16:09:00", "auth-service",         "INFO",  "Processed 1240 authentication requests. All successful."),
     ],
     deployment_events=[
         DeploymentEvent("2024-01-15 16:00:03", "order-service", "5.2.1", "5.3.0", "jenkins-ci"),
     ],
     root_cause_services=["order-service"],
     correct_fix_actions=["rollback_deployment:order-service"],
-    correct_diagnoses=["bad deployment", "nullpointerexception", "order-service deployment",
-                       "version 5.3.0", "5.3.0", "rollback", "circuit breaker", "error rate",
-                       "deployment issue", "high latency", "order service"],
+    correct_diagnoses=[
+        "bad deployment", "nullpointerexception", "order-service deployment",
+        "version 5.3.0", "5.3.0", "rollback", "circuit breaker", "error rate",
+        "deployment issue", "high latency", "order service",
+    ],
+    correct_diagnosis_groups=[
+        [
+            "bad deployment", "nullpointerexception", "order-service deployment",
+            "version 5.3.0", "5.3.0", "rollback", "circuit breaker", "error rate",
+            "deployment issue", "high latency", "order service",
+        ],
+    ],
     max_steps=12,
+    # diag(20) + fix(30) + first-look(5) + postmortem(5+10) + efficiency(~5) + reasoning(~10)
+    max_reward=85.0,
+    escalation_correct=False,
 )
 
 
@@ -251,10 +276,22 @@ SCENARIO_3 = Scenario(
         "restart_service:postgres-db",
         "restart_service:user-service",
     ],
-    correct_diagnoses=["connection pool", "db connection", "connection exhausted", "postgres",
-                       "connection leak", "timeout", "cannot acquire", "database connection",
-                       "pool exhausted", "db pool", "connection timeout"],
+    correct_diagnoses=[
+        "connection pool", "db connection", "connection exhausted", "postgres",
+        "connection leak", "timeout", "cannot acquire", "database connection",
+        "pool exhausted", "db pool", "connection timeout",
+    ],
+    correct_diagnosis_groups=[
+        [
+            "connection pool", "db connection", "connection exhausted", "postgres",
+            "connection leak", "timeout", "cannot acquire", "database connection",
+            "pool exhausted", "db pool", "connection timeout",
+        ],
+    ],
     max_steps=15,
+    # diag(20) + two fixes(60) + first-look(10) + postmortem(5+10) + efficiency(~5) + reasoning(~12)
+    max_reward=122.0,
+    escalation_correct=False,
 )
 
 
@@ -312,17 +349,17 @@ SCENARIO_4 = Scenario(
         ),
     },
     logs=[
-        LogEntry("2024-01-15 20:10:01", "user-service",       "WARN",  "Memory usage at 91% (limit: 1Gi)"),
-        LogEntry("2024-01-15 20:11:33", "user-service",       "FATAL", "Killed by signal 9 (OOMKilled). Memory limit exceeded: 1Gi"),
-        LogEntry("2024-01-15 20:11:35", "auth-service",       "ERROR", "gRPC connection to user-service failed: connection refused"),
-        LogEntry("2024-01-15 20:11:35", "order-service",      "ERROR", "gRPC connection to user-service failed: connection refused"),
-        LogEntry("2024-01-15 20:11:36", "auth-service",       "ERROR", "Unable to validate user session: upstream unavailable. Returning 503."),
-        LogEntry("2024-01-15 20:11:36", "order-service",      "ERROR", "Unable to fetch user profile: upstream unavailable. Returning 503."),
-        LogEntry("2024-01-15 20:11:40", "api-gateway",        "ERROR", "Upstream auth-service: 503. Upstream order-service: 503."),
-        LogEntry("2024-01-15 20:12:00", "notification-service","WARN", "Failed to send 340 notifications (user-service unreachable for preferences fetch)"),
-        LogEntry("2024-01-15 20:13:00", "redis-cache",        "WARN",  "Eviction rate elevated: 2400 keys/min (normal: ~200 keys/min)"),
-        LogEntry("2024-01-15 20:14:00", "redis-cache",        "WARN",  "Memory at 71%. LRU eviction active."),
-        LogEntry("2024-01-15 20:15:00", "api-gateway",        "ERROR", "auth-service 100% error rate for 3min 20sec. Firing CRITICAL alert."),
+        LogEntry("2024-01-15 20:10:01", "user-service",        "WARN",  "Memory usage at 91% (limit: 1Gi)"),
+        LogEntry("2024-01-15 20:11:33", "user-service",        "FATAL", "Killed by signal 9 (OOMKilled). Memory limit exceeded: 1Gi"),
+        LogEntry("2024-01-15 20:11:35", "auth-service",        "ERROR", "gRPC connection to user-service failed: connection refused"),
+        LogEntry("2024-01-15 20:11:35", "order-service",       "ERROR", "gRPC connection to user-service failed: connection refused"),
+        LogEntry("2024-01-15 20:11:36", "auth-service",        "ERROR", "Unable to validate user session: upstream unavailable. Returning 503."),
+        LogEntry("2024-01-15 20:11:36", "order-service",       "ERROR", "Unable to fetch user profile: upstream unavailable. Returning 503."),
+        LogEntry("2024-01-15 20:11:40", "api-gateway",         "ERROR", "Upstream auth-service: 503. Upstream order-service: 503."),
+        LogEntry("2024-01-15 20:12:00", "notification-service","WARN",  "Failed to send 340 notifications (user-service unreachable for preferences fetch)"),
+        LogEntry("2024-01-15 20:13:00", "redis-cache",         "WARN",  "Eviction rate elevated: 2400 keys/min (normal: ~200 keys/min)"),
+        LogEntry("2024-01-15 20:14:00", "redis-cache",         "WARN",  "Memory at 71%. LRU eviction active."),
+        LogEntry("2024-01-15 20:15:00", "api-gateway",         "ERROR", "auth-service 100% error rate for 3min 20sec. Firing CRITICAL alert."),
     ],
     deployment_events=[],
     root_cause_services=["user-service"],
@@ -330,10 +367,22 @@ SCENARIO_4 = Scenario(
         "restart_service:user-service",
         "enable_circuit_breaker:order-service",
     ],
-    correct_diagnoses=["oom", "out of memory", "user-service", "cascade", "cascading failure",
-                       "upstream", "memory", "oomkill", "memory limit", "circuit",
-                       "downstream", "service failure", "upstream failure"],
+    correct_diagnoses=[
+        "oom", "out of memory", "user-service", "cascade", "cascading failure",
+        "upstream", "memory", "oomkill", "memory limit", "circuit",
+        "downstream", "service failure", "upstream failure",
+    ],
+    correct_diagnosis_groups=[
+        [
+            "oom", "out of memory", "user-service", "cascade", "cascading failure",
+            "upstream", "memory", "oomkill", "memory limit", "circuit",
+            "downstream", "service failure", "upstream failure",
+        ],
+    ],
     max_steps=18,
+    # diag(20) + fix(30) + circuit(30) + first-look(5) + postmortem(5+10) + efficiency(~5) + reasoning(~15)
+    max_reward=120.0,
+    escalation_correct=False,
 )
 
 
@@ -394,22 +443,22 @@ SCENARIO_5 = Scenario(
     },
     logs=[
         # DDoS evidence on api-gateway
-        LogEntry("2024-01-15 22:28:00", "api-gateway",   "WARN",  "Unusually high request rate: 48,000 req/min (normal: 2,000 req/min)"),
-        LogEntry("2024-01-15 22:28:30", "api-gateway",   "WARN",  "Single IP 203.0.113.42 responsible for 45,000 req/min"),
-        LogEntry("2024-01-15 22:29:00", "api-gateway",   "ERROR", "Rate limit threshold breached. Dropping requests. error_rate rising."),
-        LogEntry("2024-01-15 22:29:30", "api-gateway",   "ERROR", "CPU at 98%. Thread pool exhausted. Queuing degraded."),
+        LogEntry("2024-01-15 22:28:00", "api-gateway",      "WARN",  "Unusually high request rate: 48,000 req/min (normal: 2,000 req/min)"),
+        LogEntry("2024-01-15 22:28:30", "api-gateway",      "WARN",  "Single IP 203.0.113.42 responsible for 45,000 req/min"),
+        LogEntry("2024-01-15 22:29:00", "api-gateway",      "ERROR", "Rate limit threshold breached. Dropping requests. error_rate rising."),
+        LogEntry("2024-01-15 22:29:30", "api-gateway",      "ERROR", "CPU at 98%. Thread pool exhausted. Queuing degraded."),
         # Auth config drift evidence
-        LogEntry("2024-01-15 22:25:01", "auth-service",  "INFO",  "Config reload triggered by configmap update: auth-config-v2"),
-        LogEntry("2024-01-15 22:25:05", "auth-service",  "WARN",  "JWT_SECRET changed in environment. All active sessions may be invalidated."),
-        LogEntry("2024-01-15 22:26:00", "auth-service",  "ERROR", "JWT validation failed: signature verification failed (token=eyJhbGci...)"),
-        LogEntry("2024-01-15 22:26:01", "auth-service",  "ERROR", "JWT validation failed: signature verification failed (token=eyJhbGci...)"),
-        LogEntry("2024-01-15 22:27:00", "auth-service",  "ERROR", "100% of JWT validation requests failing. JWT_SECRET mismatch suspected."),
+        LogEntry("2024-01-15 22:25:01", "auth-service",     "INFO",  "Config reload triggered by configmap update: auth-config-v2"),
+        LogEntry("2024-01-15 22:25:05", "auth-service",     "WARN",  "JWT_SECRET changed in environment. All active sessions may be invalidated."),
+        LogEntry("2024-01-15 22:26:00", "auth-service",     "ERROR", "JWT validation failed: signature verification failed (token=eyJhbGci...)"),
+        LogEntry("2024-01-15 22:26:01", "auth-service",     "ERROR", "JWT validation failed: signature verification failed (token=eyJhbGci...)"),
+        LogEntry("2024-01-15 22:27:00", "auth-service",     "ERROR", "100% of JWT validation requests failing. JWT_SECRET mismatch suspected."),
         # Downstream cascades
-        LogEntry("2024-01-15 22:29:00", "order-service", "ERROR", "Authentication required but auth-service returning 401 for all requests"),
-        LogEntry("2024-01-15 22:29:00", "user-service",  "ERROR", "Authentication required but auth-service returning 401 for all requests"),
+        LogEntry("2024-01-15 22:29:00", "order-service",    "ERROR", "Authentication required but auth-service returning 401 for all requests"),
+        LogEntry("2024-01-15 22:29:00", "user-service",     "ERROR", "Authentication required but auth-service returning 401 for all requests"),
         # Red herring — inventory degraded due to DDoS flooding shared DB connections
-        LogEntry("2024-01-15 22:29:30", "inventory-service","WARN","Database query latency elevated: 780ms (normal: 50ms). Possibly resource contention."),
-        LogEntry("2024-01-15 22:30:00", "api-gateway",   "ERROR", "Error rate 95% sustained for 90 seconds. Firing CRITICAL multi-alert."),
+        LogEntry("2024-01-15 22:29:30", "inventory-service","WARN",  "Database query latency elevated: 780ms (normal: 50ms). Possibly resource contention."),
+        LogEntry("2024-01-15 22:30:00", "api-gateway",      "ERROR", "Error rate 95% sustained for 90 seconds. Firing CRITICAL multi-alert."),
     ],
     deployment_events=[
         DeploymentEvent("2024-01-15 22:25:00", "auth-service", "config-v1", "config-v2", "automated-configmap-sync"),
@@ -425,7 +474,91 @@ SCENARIO_5 = Scenario(
         "traffic spike", "rate limiting", "misconfiguration", "config",
         "secret", "authentication", "surge",
     ],
+    # TWO independent diagnosis groups — one per root cause
+    correct_diagnosis_groups=[
+        # Group 0: DDoS / traffic surge on api-gateway
+        ["ddos", "rate limit", "ip", "203.0.113", "traffic spike", "rate limiting", "surge"],
+        # Group 1: JWT config drift on auth-service
+        ["jwt", "jwt_secret", "config drift", "configmap", "auth config",
+         "misconfiguration", "config", "secret", "authentication"],
+    ],
     max_steps=22,
+    # two diags(40) + two fixes(60) + first-look(10) + postmortem(5+10) + reasoning(~18)
+    max_reward=143.0,
+    escalation_correct=False,
+)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 6 — False Alarm / Planned Load Test  (D: 0.2)
+# ---------------------------------------------------------------------------
+
+SCENARIO_6 = Scenario(
+    id=6,
+    name="False Alarm: Planned Load Test",
+    difficulty=0.2,
+    alert_message=(
+        "[HIGH] api-gateway request rate spiked to 35,000 req/min (normal: 2,000 req/min). "
+        "CPU elevated: 72%. p99 latency: 1800ms. "
+        "Alert fired at 2024-01-15 10:05:00 UTC. "
+        "All services are currently responding. Investigate and determine if action is required."
+    ),
+    services={
+        "api-gateway": ServiceState(
+            name="api-gateway", status="degraded",
+            cpu_pct=72.0, memory_pct=55.0,
+            error_rate_pct=4.0, p99_latency_ms=1800.0,
+        ),
+        "user-service": ServiceState(
+            name="user-service", status="healthy",
+            cpu_pct=38.0, memory_pct=41.0,
+            error_rate_pct=0.0, p99_latency_ms=95.0,
+        ),
+        "order-service": ServiceState(
+            name="order-service", status="healthy",
+            cpu_pct=42.0, memory_pct=48.0,
+            error_rate_pct=0.0, p99_latency_ms=110.0,
+        ),
+        "auth-service": ServiceState(
+            name="auth-service", status="healthy",
+            cpu_pct=30.0, memory_pct=33.0,
+            error_rate_pct=0.0, p99_latency_ms=48.0,
+        ),
+        "postgres-db": ServiceState(
+            name="postgres-db", status="healthy",
+            cpu_pct=25.0, memory_pct=44.0,
+            error_rate_pct=0.0, p99_latency_ms=16.0,
+        ),
+    },
+    logs=[
+        LogEntry("2024-01-15 10:00:00", "api-gateway",  "INFO",  "Scheduled load test started by load-test-runner@ci-pipeline (planned window: 10:00–10:30 UTC)"),
+        LogEntry("2024-01-15 10:00:30", "api-gateway",  "INFO",  "Request rate climbing: 5,000 req/min → load test ramp-up phase"),
+        LogEntry("2024-01-15 10:02:00", "api-gateway",  "WARN",  "Request rate: 25,000 req/min. CPU at 61%. Within load test parameters."),
+        LogEntry("2024-01-15 10:04:00", "api-gateway",  "WARN",  "Request rate: 35,000 req/min. CPU at 72%. p99 latency elevated (expected during load test)."),
+        LogEntry("2024-01-15 10:05:00", "api-gateway",  "ERROR", "Automated alert triggered: request rate exceeds threshold. NOTE: load test in progress."),
+        LogEntry("2024-01-15 10:05:01", "user-service", "INFO",  "Handling elevated load gracefully. No errors detected."),
+        LogEntry("2024-01-15 10:05:01", "order-service","INFO",  "Handling elevated load gracefully. No errors detected."),
+        LogEntry("2024-01-15 10:05:02", "auth-service", "INFO",  "1,200 authentication requests processed. All successful."),
+        LogEntry("2024-01-15 10:05:10", "api-gateway",  "INFO",  "load-test-runner: target throughput reached. Sustaining for 25 minutes."),
+    ],
+    deployment_events=[],
+    root_cause_services=[],  # no root cause — this is intentional load
+    correct_fix_actions=[],  # no fix needed — applying any fix is penalised
+    correct_diagnoses=[
+        "load test", "planned", "expected", "load-test-runner", "ci-pipeline",
+        "scheduled", "no action", "intentional", "test traffic",
+    ],
+    correct_diagnosis_groups=[
+        [
+            "load test", "planned", "expected", "load-test-runner", "ci-pipeline",
+            "scheduled", "no action", "intentional", "test traffic",
+        ],
+    ],
+    max_steps=10,
+    # diag(20) + no-fix bonus(20) + postmortem(5+10) + first-look(5) + reasoning(~5)
+    max_reward=65.0,
+    escalation_correct=False,
+    hint="Tip: Check api-gateway logs carefully — the alert details and recent log entries may tell the full story.",
 )
 
 
@@ -439,6 +572,7 @@ ALL_SCENARIOS: List[Scenario] = [
     SCENARIO_3,
     SCENARIO_4,
     SCENARIO_5,
+    SCENARIO_6,
 ]
 
 SCENARIO_BY_ID: Dict[int, Scenario] = {s.id: s for s in ALL_SCENARIOS}

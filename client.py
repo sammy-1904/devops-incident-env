@@ -41,6 +41,7 @@ class IncidentEnv(EnvClient[IncidentAction, IncidentObservation, IncidentState])
         return {
             "action_type": action.action_type,
             "service":     action.service,
+            "hypothesis":  action.hypothesis,
             "parameters":  action.parameters,
             "reasoning":   action.reasoning,
             "metadata":    action.metadata,
@@ -52,8 +53,8 @@ class IncidentEnv(EnvClient[IncidentAction, IncidentObservation, IncidentState])
 
     def _parse_result(self, payload: Dict[str, Any]) -> StepResult[IncidentObservation]:
         # The server response is: {"observation": {...}, "reward": ..., "done": ...}
-        # Our custom fields (active_alerts, steps_remaining, etc.) live inside "observation"
-        obs_data = payload.get("observation", payload)  # nested dict with all our fields
+        # Our custom fields live inside "observation"
+        obs_data = payload.get("observation", payload)
 
         obs = IncidentObservation(
             done=payload.get("done", obs_data.get("done", False)),
@@ -66,6 +67,7 @@ class IncidentEnv(EnvClient[IncidentAction, IncidentObservation, IncidentState])
             incident_resolved=obs_data.get("incident_resolved", False),
             step_reward=obs_data.get("step_reward", 0.0),
             hint=obs_data.get("hint"),
+            recent_deployments=obs_data.get("recent_deployments", []),
         )
         return StepResult(
             observation=obs,
