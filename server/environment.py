@@ -8,6 +8,7 @@ Confirmed API (from inspecting openenv-core):
   - state: property returning StateT
 """
 
+import random as _random
 import uuid
 from typing import List, Optional, Set
 
@@ -17,7 +18,7 @@ from .models import IncidentAction, IncidentObservation, IncidentState
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.scenarios import ALL_SCENARIOS, SCENARIO_BY_ID, Scenario, ServiceState
+from data.scenarios import generate_scenario, ALL_SCENARIO_IDS, Scenario, ServiceState
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,8 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         self._wrong_fixes_applied: List[str] = []   # tracks wrong fixes for Scenario 6 bonus
         self._scenario_index: int = -1
         self._diagnosis_groups_awarded: Set[int] = set()   # indices into correct_diagnosis_groups
+        self._queried_services: Set[str] = set()           # ANY service queried (gate for diagnose)
+        self._first_looked_root_causes: Set[str] = set()   # dedup first-look +5 bonus per service
 
     # -----------------------------------------------------------------------
     # reset()
@@ -80,12 +83,14 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
             episode_id: Caller-supplied episode ID; auto-generated if None.
             scenario_id: 1–6 to pick a specific scenario; cycles if None.
         """
-        # Pick scenario
-        if scenario_id is not None and scenario_id in SCENARIO_BY_ID:
-            self._scenario = SCENARIO_BY_ID[scenario_id]
+        # Pick scenario — generate a fresh variant using the provided seed (or a random one)
+        effective_seed = seed if seed is not None else _random.randint(0, 2**31 - 1)
+        if scenario_id is not None and scenario_id in ALL_SCENARIO_IDS:
+            self._scenario = generate_scenario(scenario_id, seed=effective_seed)
         else:
-            self._scenario_index = (self._scenario_index + 1) % len(ALL_SCENARIOS)
-            self._scenario = ALL_SCENARIOS[self._scenario_index]
+            self._scenario_index = (self._scenario_index + 1) % len(ALL_SCENARIO_IDS)
+            self._scenario = generate_scenario(ALL_SCENARIO_IDS[self._scenario_index],
+                                               seed=effective_seed)
 
         sc = self._scenario
 
@@ -108,6 +113,8 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         self._fixes_applied = []
         self._wrong_fixes_applied = []
         self._diagnosis_groups_awarded = set()
+        self._queried_services = set()
+        self._first_looked_root_causes = set()
 
         self._state = IncidentState(
             episode_id=episode_id or str(uuid.uuid4()),
@@ -139,7 +146,7 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
 
         return IncidentObservation(
             done=False,
-            reward=0.0,
+            reward=None,   # no action taken on reset; step_reward=0.0 is the domain field
             metadata={"scenario_max_reward": sc.max_reward},
             action_result=(
                 f"=== INCIDENT OPENED ===\n"
@@ -179,6 +186,10 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         **kwargs,
     ) -> IncidentObservation:
         """Execute one agent action and return the resulting observation."""
+        if self._state.resolved or (self._scenario and self._state.step_count >= self._scenario.max_steps):
+            raise RuntimeError(
+                "step() called after the episode has ended. Call reset() to start a new episode."
+            )
         sc = self._scenario
         self._state.step_count += 1
         steps_left = sc.max_steps - self._state.step_count
@@ -244,9 +255,10 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         if self._state.resolved:
             done = True
 
-        # Efficiency bonus on resolution
+        # Efficiency bonus on resolution — added to step_reward so it surfaces in inference.py
         if done and self._state.resolved and steps_left > 0:
             efficiency_bonus = round(10.0 * (steps_left / sc.max_steps), 2)
+            step_reward += efficiency_bonus
             self._state.total_reward += efficiency_bonus
             result_text += f"\n\n[EFFICIENCY BONUS] +{efficiency_bonus:.1f} ({steps_left} steps remaining)."
 
@@ -295,9 +307,11 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         if service not in self._services:
             return (f"Error: '{service}' not found. Available: {', '.join(self._services.keys())}", 0.0)
 
+        self._queried_services.add(service)
+
         bonus = 0.0
-        action_key = f"query_logs:{service}"
-        if self._services[service].is_root_cause and self._action_log.count(action_key) == 0:
+        if self._services[service].is_root_cause and service not in self._first_looked_root_causes:
+            self._first_looked_root_causes.add(service)
             bonus = R_FIRST_LOOK_CULPRIT
             self._state.services_investigated += 1
 
@@ -319,10 +333,12 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         if service not in self._services:
             return (f"Error: '{service}' not found. Available: {', '.join(self._services.keys())}", 0.0)
 
+        self._queried_services.add(service)
+
         svc = self._services[service]
         bonus = 0.0
-        action_key = f"check_metrics:{service}"
-        if svc.is_root_cause and self._action_log.count(action_key) == 0:
+        if svc.is_root_cause and service not in self._first_looked_root_causes:
+            self._first_looked_root_causes.add(service)
             bonus = R_FIRST_LOOK_CULPRIT
             self._state.services_investigated += 1
 
@@ -373,12 +389,15 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
                     True,
                 )
             else:
-                still_down = [n for n, s in self._services.items() if s.status in ("down", "degraded") and n != service]
-                still_down_str = ", ".join(still_down) if still_down else "check dashboard"
+                # Show only the services that are part of remaining correct fixes — not all
+                # degraded/down services (which may just be downstream victims).
+                remaining_fixes = [f for f in sc.correct_fix_actions if f not in self._fixes_applied]
+                remaining_svc_names = [f.split(":", 1)[1] for f in remaining_fixes]
+                still_down_str = ", ".join(remaining_svc_names) if remaining_svc_names else "check dashboard"
                 return (
                     f"[PARTIAL SUCCESS] {action_type.replace('_', ' ').title()} on {service}. +{R_PARTIAL_FIX:.0f} reward.\n"
-                    f"Other issue(s) still active. Services still affected: {still_down_str}.\n"
-                    f"Apply the same fix type ({action_type}) to other affected services.\n",
+                    f"Other root cause(s) still active. Next service(s) to address: {still_down_str}.\n"
+                    f"Check logs/metrics on those specific services to confirm the root cause, then apply the correct fix.\n",
                     R_PARTIAL_FIX,
                     False,
                 )
@@ -395,13 +414,15 @@ class IncidentEnvironment(Environment[IncidentAction, IncidentObservation, Incid
         sc = self._scenario
         hypothesis_lower = hypothesis.lower()
 
-        # Anti-reward-hacking gate: require at least one root-cause service to have been
-        # investigated before a diagnosis can earn reward.  This prevents a model from
-        # collecting +20 by keyword-stuffing ("oom connection pool deployment ddos …")
-        # without doing any actual investigation.
-        if self._state.services_investigated == 0:
+        # Anti-reward-hacking gate: require at least one service to have been investigated
+        # before a diagnosis can earn reward.  This prevents a model from collecting +20 by
+        # keyword-stuffing without doing any actual investigation.  We check _queried_services
+        # (any service) rather than services_investigated (root-cause only) so that false-alarm
+        # scenarios — which have no root-cause services — can still be diagnosed correctly after
+        # the agent inspects the logs.
+        if not self._queried_services:
             return (
-                "[DIAGNOSIS REJECTED] You have not investigated any root-cause services yet.\n"
+                "[DIAGNOSIS REJECTED] You have not investigated any services yet.\n"
                 "Use query_logs or check_metrics on the affected services first, then diagnose.\n"
                 "No reward awarded.",
                 0.0,

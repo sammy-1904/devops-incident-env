@@ -51,7 +51,9 @@ class IncidentObservation(Observation):
     active_alerts: List[str] = Field(default_factory=list, description="Currently firing alert strings")
     steps_remaining: int = Field(default=0, description="Steps left before episode auto-fails")
     incident_resolved: bool = Field(default=False, description="Whether the incident is fully resolved")
-    step_reward: float = Field(default=0.0, description="Reward earned on this specific step")
+    # step_reward mirrors the inherited `reward` field so inference.py and the Gradio UI can read
+    # it by a domain-meaningful name without relying on the OpenEnv base field name.
+    step_reward: float = Field(default=0.0, description="Reward earned on this specific step (mirrors the inherited `reward` field)")
     hint: Optional[str] = Field(default=None, description="Guidance hint (only on Scenario 1 & 6, first 3 steps)")
     recent_deployments: List[str] = Field(
         default_factory=list,

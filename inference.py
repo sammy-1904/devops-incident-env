@@ -344,6 +344,7 @@ async def run_episode(oai_client: OpenAI, env: IncidentEnv, scenario_id: int) ->
         _allow_postmortem = False
         _terminal_actions = {"write_postmortem", "escalate"}
         tool_name = ""
+        _consecutive_no_tool_calls = 0   # hard-stop after 3 in a row
 
         for step in range(1, MAX_STEPS + 1):
             if result.done and not _allow_postmortem:
@@ -360,29 +361,74 @@ async def run_episode(oai_client: OpenAI, env: IncidentEnv, scenario_id: int) ->
                         model=MODEL_NAME,
                         messages=messages,
                         tools=TOOLS,
-                        tool_choice="auto",
+                        tool_choice="required",
                     ),
                 )
             except Exception as e:
-                error_msg = str(e)
-                log_step(step=step, action="llm_error", reward=0.0, done=True, error=error_msg)
-                break
+                # Fallback: some hosted models don't support tool_choice="required" —
+                # retry once with "auto" before giving up.
+                try:
+                    loop2 = asyncio.get_running_loop()
+                    response = await loop2.run_in_executor(
+                        None,
+                        lambda: oai_client.chat.completions.create(
+                            model=MODEL_NAME,
+                            messages=messages,
+                            tools=TOOLS,
+                            tool_choice="auto",
+                        ),
+                    )
+                except Exception as e2:
+                    error_msg = str(e2)
+                    log_step(step=step, action="llm_error", reward=0.0, done=True, error=error_msg)
+                    break
 
             msg = response.choices[0].message
 
-            # No tool call — give a context-aware nudge
+            # No tool call — model ignored required; nudge once and continue
             if not msg.tool_calls:
+                _consecutive_no_tool_calls += 1
                 content = msg.content or "(no response)"
                 messages.append({"role": "assistant", "content": content})
+
+                # Hard stop: 3 consecutive non-actions → force escalate to end the episode
+                # cleanly rather than burning all remaining steps on no-ops.
+                if _consecutive_no_tool_calls >= 3:
+                    log_step(step=step, action="no_tool_call", reward=0.0, done=False, error=None)
+                    try:
+                        result = await env.step(IncidentAction(
+                            action_type="escalate",
+                            reasoning="Agent unable to determine next action. Escalating to human on-call.",
+                        ))
+                        obs = result.observation
+                        reward = float(obs.step_reward or 0.0)
+                        rewards.append(reward)
+                        log_step(step=step + 1, action="escalate(forced)", reward=reward, done=True, error=None)
+                    except Exception:
+                        pass
+                    break
+
                 if obs and obs.incident_resolved:
-                    nudge = "Call write_postmortem() now to close the incident and earn the quality bonus."
+                    nudge = (
+                        "You MUST call write_postmortem() now. "
+                        "Do not write text — call the tool directly."
+                    )
                 elif not rewards:
-                    nudge = "Call query_logs() on the service mentioned in the alert to start investigating."
+                    nudge = (
+                        "You MUST call query_logs(service=...) immediately. "
+                        "Do not write text — call the tool directly."
+                    )
                 else:
-                    nudge = "Use one of the available tools to continue your investigation or apply a fix."
+                    nudge = (
+                        "You MUST call one of the available tools now. "
+                        "Do not write text — call a tool directly."
+                    )
                 messages.append({"role": "user", "content": nudge})
                 log_step(step=step, action="no_tool_call", reward=0.0, done=False, error=None)
                 continue
+
+            # Real tool call — reset the no_tool_call streak counter
+            _consecutive_no_tool_calls = 0
 
             # Parse tool call
             tool_call = msg.tool_calls[0]
